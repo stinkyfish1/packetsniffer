@@ -5,53 +5,123 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <netinet/ether.h>
 #include <cstring>
 #include <limits>
+#include <netdb.h>
 
 #ifdef __APPLE__
 #define MACOS
 #endif
 
-/*
- * packet_handler 
- * Desription: This funstion is used to handle the packets as they come to the 
- * application and handled internally to the function. This is where the user may pull
- * a part the packet header and content data to be processed.  
- */
+void print_device_info(const char* dev) {
+    struct ifaddrs* ifap;
+    struct sockaddr_in* addr;
+
+    if (getifaddrs(&ifap) == 0) {
+        for (struct ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr != nullptr && ifa->ifa_addr->sa_family == AF_INET) {
+                addr = (struct sockaddr_in*)ifa->ifa_addr;
+                if (strcmp(ifa->ifa_name, dev) == 0) {
+                    std::cout << "Device: " << ifa->ifa_name << std::endl;
+                    std::cout << "IP Address: " << inet_ntoa(addr->sin_addr) << std::endl;
+                }
+            }
+        }
+        freeifaddrs(ifap);
+    } else {
+        std::cerr << "Failed to get IP address." << std::endl;
+    }
+}
+
+void print_hex(const unsigned char* data, size_t len) {
+    std::cout << "Packet Data (Hex):\n";
+    
+    // Define how many bytes to print (e.g., 64 bytes)
+    size_t max_bytes_to_print = 64;
+    size_t bytes_to_print = std::min(len, max_bytes_to_print);
+
+    for (size_t i = 0; i < bytes_to_print; ++i) {
+        printf("%02x ", data[i]);
+        if (i % 16 == 15) {
+            std::cout << std::endl;
+        }
+    }
+    
+    // If the packet is longer than the specified number of bytes, indicate truncation
+    if (len > max_bytes_to_print) {
+        std::cout << "\n... (more bytes not displayed)" << std::endl;
+    }
+    
+    std::cout << std::endl;
+}
+
+
+void print_ascii(const unsigned char* data, size_t len) {
+    std::cout << "Packet Data (ASCII):\n";
+    for (size_t i = 0; i < len; ++i) {
+        char c = data[i];
+        // Only print printable characters (space, letters, digits, symbols)
+        if (isprint(c)) {
+            std::cout << c;
+        } else if (i == len - 1) {
+            // Optionally, show a newline at the end of the printable part
+            std::cout << std::endl;
+        }
+    }
+    std::cout << std::endl;
+}
+
+
+std::string resolve_ip_to_hostname(const struct in_addr& ip) {
+    struct hostent* host = gethostbyaddr(&ip, sizeof(ip), AF_INET);
+    return host ? host->h_name : "Unknown Host";
+}
+
+void parse_http(const unsigned char* data, size_t len) {
+    std::string packet_str((const char*)data, len);
+    size_t pos = packet_str.find("GET ");
+    if (pos != std::string::npos) {
+        size_t end_pos = packet_str.find(" HTTP/1.1", pos);
+        if (end_pos != std::string::npos) {
+            std::string website = packet_str.substr(pos + 4, end_pos - pos - 4);
+            std::cout << "Accessed Website (HTTP GET Request): " << website << std::endl;
+        }
+    }
+}
+
+void parse_dns(const unsigned char* data, size_t len) {
+    if (len > 42) {  // Minimum size for DNS packet
+        std::string domain_name((const char*)data + 12, len - 12);
+        std::cout << "DNS Query for Domain: " << domain_name << std::endl;
+    }
+}
+
 void packet_handler(unsigned char* user_data, const struct pcap_pkthdr* pkthdr, const unsigned char* packet_data) {
     std::cout << "********** Packet Data Captured **********" << std::endl;
     std::cout << "Captured Packet Length: " << pkthdr->len << " bytes." << std::endl;
 
 #ifdef MACOS
-    /*
-     * On macOS, Ethernet headers are not available, so we skip Ethernet parsing
-     * Check if it's an IP packet
-     */
-
     if (pkthdr->len >= sizeof(struct ip)) {
         struct ip* ip_header = (struct ip*)packet_data;
-        std::cout << "Source IP: " << inet_ntoa(ip_header->ip_src) << std::endl;
-        std::cout << "Destination IP: " << inet_ntoa(ip_header->ip_dst) << std::endl;
+        std::cout << "Source IP: " << inet_ntoa(ip_header->ip_src) << " (" << resolve_ip_to_hostname(ip_header->ip_src) << ")" << std::endl;
+        std::cout << "Destination IP: " << inet_ntoa(ip_header->ip_dst) << " (" << resolve_ip_to_hostname(ip_header->ip_dst) << ")" << std::endl;
 
-        /* Check if it's a TCP packet */
         if (ip_header->ip_p == IPPROTO_TCP && pkthdr->len >= (sizeof(struct ip) + sizeof(struct tcphdr))) {
             struct tcphdr* tcp_header = (struct tcphdr*)(packet_data + ip_header->ip_hl * 4); // Skip IP header
             std::cout << "Source Port: " << ntohs(tcp_header->th_sport) << std::endl;
             std::cout << "Destination Port: " << ntohs(tcp_header->th_dport) << std::endl;
+
+            // Check for HTTP or DNS traffic
+            if (ntohs(tcp_header->th_dport) == 80 || ntohs(tcp_header->th_sport) == 80) {
+                parse_http(packet_data + sizeof(struct ip) + sizeof(struct tcphdr), pkthdr->len - sizeof(struct ip) - sizeof(struct tcphdr));
+            }
         }
     }
 #else
-    /*
-     * On Linux, we can parse Ethernet headers
-     * Check if it's an Ethernet (DLT_EN10MB) packet
-     */
     int data_link_type = pcap_datalink(nullptr);
     if (data_link_type == DLT_EN10MB) {
-
-        /* Check if the packet is large enough to contain an Ethernet header */
         if (pkthdr->len >= sizeof(struct ether_header)) {
-
-            /* Parse Ethernet header */
             struct ether_header* eth_header = (struct ether_header*)packet_data;
             std::cout << "Source MAC: ";
             for (int i = 0; i < 6; ++i) {
@@ -72,137 +142,63 @@ void packet_handler(unsigned char* user_data, const struct pcap_pkthdr* pkthdr, 
         }
     }
     
-    /* Check if it's an IP packet */
     if (pkthdr->len >= sizeof(struct ip)) {
         struct ip* ip_header = (struct ip*)(packet_data + sizeof(struct ether_header)); // Skip Ethernet header
-        std::cout << "Source IP: " << inet_ntoa(ip_header->ip_src) << std::endl;
-        std::cout << "Destination IP: " << inet_ntoa(ip_header->ip_dst) << std::endl;
+        std::cout << "Source IP: " << inet_ntoa(ip_header->ip_src) << " (" << resolve_ip_to_hostname(ip_header->ip_src) << ")" << std::endl;
+        std::cout << "Destination IP: " << inet_ntoa(ip_header->ip_dst) << " (" << resolve_ip_to_hostname(ip_header->ip_dst) << ")" << std::endl;
 
-        /* Check if it's a TCP packet */
         if (ip_header->ip_p == IPPROTO_TCP && pkthdr->len >= (sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr))) {
             struct tcphdr* tcp_header = (struct tcphdr*)(packet_data + sizeof(struct ether_header) + ip_header->ip_hl * 4); // Skip IP header
             std::cout << "Source Port: " << ntohs(tcp_header->th_sport) << std::endl;
             std::cout << "Destination Port: " << ntohs(tcp_header->th_dport) << std::endl;
+
+            // Check for HTTP or DNS traffic
+            if (ntohs(tcp_header->th_dport) == 80 || ntohs(tcp_header->th_sport) == 80) {
+                parse_http(packet_data + sizeof(struct ether_header) + sizeof(struct ip) + sizeof(struct tcphdr), pkthdr->len - sizeof(struct ether_header) - sizeof(struct ip) - sizeof(struct tcphdr));
+            }
+            else if (ip_header->ip_p == IPPROTO_UDP) {
+                parse_dns(packet_data + sizeof(struct ether_header) + sizeof(struct ip), pkthdr->len - sizeof(struct ether_header) - sizeof(struct ip));
+            }
         }
     }
 #endif
 
-    /* Print packet data (hexadecimal representation) */
-    std::cout << "Packet data (hex): \n";
-    for (int i = 0; i < pkthdr->len; ++i) {
-        printf("%02x ", packet_data[i]);
-        if (i % 8 == 0) printf("\n");
-    }
-    std::cout << std::endl;
+    print_hex(packet_data, pkthdr->len);
+    print_ascii(packet_data, pkthdr->len);
 
-    /* Print packet data (ASCII representation) */
-    std::cout << "Packet data (ASCII): \n";
-    for (int i = 0; i < pkthdr->len; ++i) {
-        char c = packet_data[i];
-        if (isprint(c)) {
-            std::cout << c;
-        } else {
-            std::cout << ".";
-        }
-    }
-    std::cout << std::endl;
-        std::cout << "--------------------Packet End---------------------" << std::endl;
+    std::cout << "--------------------Packet End---------------------" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
-
-    // Use the first network device
     char* dev;
 
-    /* Check if there are at least two arguments (program name and one additional argument) */
     if (argc >= 2) {
-        /* 
-         * We will access command line arguments below using the
-         * argv array which holds argument separated by spaces 
-         */
-        std::cout << "Program name : " << argv[0] << std::endl;
-        std::cout << "Device Name  : " << argv[1] << std::endl;
-        
-        /* We assign the device name to the device variable */
         dev = argv[1];
-
-        struct ifaddrs* ifap;
-        struct sockaddr_in* addr;
-
-        /* 
-         * Below we are checking that we can aquire our local IP
-         * address and if we are successful we print it so we can 
-         * compare across packets if needed.
-         */
-        if (getifaddrs(&ifap) == 0) {
-            for (struct ifaddrs* ifa = ifap; ifa != nullptr; ifa = ifa->ifa_next) {
-                if (ifa->ifa_addr != nullptr && ifa->ifa_addr->sa_family == AF_INET) {
-                    addr = (struct sockaddr_in*)ifa->ifa_addr;
-
-                    /* 
-                     * Use "en0" for Ethernet/Wi-Fi interface 
-                     * Note: this is assigned by argv[1] 
-                     */
-                    if (strcmp(ifa->ifa_name, dev) == 0) {
-                        std::cout << "Your IP address on " << ifa->ifa_name << ": " << inet_ntoa(addr->sin_addr) << std::endl;
-                    }
-                }
-            }
-
-            /* Free the memory allocated by getifaddrs */
-            freeifaddrs(ifap); 
-        } else {
-            std::cerr << "Failed to get IP address." << std::endl;
-        }
-
+        print_device_info(dev);
     } else {
-
-        /* Print a message if there are no additional arguments */
-        std::cout << "No additional command-line arguments provided." << std::endl;
+        std::cout << "No device name provided." << std::endl;
+        return 1;
     }
 
-    /* 
-     * We create an error buffer to store any errors that may 
-     * be thrown 
-     */
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t* handle;
 
-    /* 
-     * Find all available network devices 
-     * Note: We do not use the alldevs in this
-     * program, and is only here for reference.
-     * Alldevs continats all devices on the system
-     * and can access each by walking the list
-     */
     pcap_if_t* alldevs;
     if (pcap_findalldevs(&alldevs, errbuf) == -1) {
         std::cerr << "Error finding network devices: " << errbuf << std::endl;
         return 1;
     }
 
-    pcap_if_t* device;
-    int deviceCount = 0;
-
-    /* 1 specifies permiscuous mode - meaning all network traffic is captured */
     handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
     if (handle == nullptr) {
         std::cerr << "Could not open device " << dev << ": " << errbuf << std::endl;
-        
-        /* Free all devices in the list including that stored in dev */
         pcap_freealldevs(alldevs);
         return 1;
     }
 
-    // Start capturing packets and call the packet_handler function for each packet
     pcap_loop(handle, 0, packet_handler, nullptr);
-
-    // Close the capture handle when done
     pcap_close(handle);
-
-    // Free the device list
     pcap_freealldevs(alldevs);
 
     return 0;
-
 }
